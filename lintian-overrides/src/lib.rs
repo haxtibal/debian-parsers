@@ -328,7 +328,7 @@ impl OverrideLine {
         self.package_spec().is_some()
     }
 
-    /// Get the package specification if present
+    /// Get the package specification if present, including on tagless lines.
     pub fn package_spec(&self) -> Option<PackageSpec> {
         self.syntax.children().find_map(PackageSpec::cast)
     }
@@ -590,9 +590,10 @@ fn parse_lintian_overrides(text: &str) -> (GreenNode, Vec<(String, rowan::TextSi
 /// The line is lexed in one forward pass and the resulting tokens are grouped:
 /// leading whitespace and everything from the tag onwards sit directly under
 /// the line, while the package spec (up to and including its colon) is wrapped
-/// in a PACKAGE_SPEC node. A non-empty, non-comment line that carries no tag,
-/// or one with an unterminated arch bracket, is wrapped in an ERROR node and
-/// recorded in `errors`.
+/// in a PACKAGE_SPEC node. A non-empty, non-comment line with no tag, or one
+/// with an unterminated arch bracket, is recorded in `errors`; the latter also
+/// wraps its tokens in an ERROR node since the fallback lex produces
+/// misleading tag+info tokens.
 fn parse_line(
     builder: &mut GreenNodeBuilder,
     line: &str,
@@ -608,12 +609,10 @@ fn parse_line(
         .any(|(kind, _)| !matches!(kind, WHITESPACE | COMMENT));
     let has_tag = lexed.tokens.iter().any(|(kind, _)| *kind == TAG);
 
-    // A line with content but no tag, or one with a lexing error, is malformed:
-    // record it and wrap its tokens in an ERROR node so the region is visible.
+    let wrap_error = lexed.error.is_some();
     let error = lexed
         .error
         .or_else(|| (has_content && !has_tag).then(|| "missing lintian tag".to_string()));
-    let wrap_error = error.is_some();
     if let Some(msg) = error {
         errors.push((msg, offset));
     }
@@ -1623,6 +1622,19 @@ mod tests {
     }
 
     #[test]
+    fn test_package_spec_visible_on_tagless_line() {
+        let text = "foo: \n";
+        let parsed = LintianOverrides::parse(text);
+        assert_eq!(
+            parsed.errors_with_offsets().collect::<Vec<_>>(),
+            vec![("missing lintian tag", rowan::TextSize::from(0))]
+        );
+
+        let line = parsed.tree().lines().next().unwrap();
+        assert_eq!(line.package_spec().unwrap().package_name().unwrap(), "foo");
+    }
+
+    #[test]
     fn test_spec_without_tag_is_error() {
         let text = "libcurl4:\n";
         let parsed = LintianOverrides::parse(text);
@@ -1643,6 +1655,23 @@ mod tests {
             vec![("unterminated architecture list", rowan::TextSize::from(0))]
         );
         assert_eq!(parsed.tree().text(), text);
+
+        let has_error_node = parsed
+            .syntax()
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::ERROR);
+        assert!(has_error_node);
+    }
+
+    #[test]
+    fn test_tagless_line_has_no_error_node() {
+        let text = "foo:\n";
+        let parsed = LintianOverrides::parse(text);
+        let has_error_node = parsed
+            .syntax()
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::ERROR);
+        assert!(!has_error_node);
     }
 
     #[test]
@@ -1665,16 +1694,6 @@ mod tests {
         assert_eq!(lines[2].tag().unwrap().text(), "tag2");
     }
 
-    #[test]
-    fn test_error_line_wrapped_in_error_node() {
-        let text = "libcurl4:\n";
-        let parsed = LintianOverrides::parse(text);
-        let has_error_node = parsed
-            .syntax()
-            .descendants()
-            .any(|n| n.kind() == SyntaxKind::ERROR);
-        assert!(has_error_node);
-    }
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "lintian-overrides-test-{}-{}",
