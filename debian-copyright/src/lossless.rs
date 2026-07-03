@@ -765,6 +765,34 @@ impl FilesParagraph {
         self.0.remove(name);
     }
 
+    /// Raw value of the `Files:` field, as it appears in the source document.
+    ///
+    /// Returns the same string `self.as_deb822().get("Files")` would: the
+    /// multi-line value joined with `\n` between continuation lines,
+    /// without whitespace splitting. Callers that want the individual
+    /// patterns should use [`files`](Self::files) or
+    /// [`file_spans`](Self::file_spans) instead. This is useful for
+    /// building selectors or diffs that must reference the field's exact
+    /// on-disk value. Returns `None` when the paragraph carries no
+    /// `Files:` field.
+    pub fn files_raw(&self) -> Option<String> {
+        self.0.get("Files")
+    }
+
+    /// Line number (0-indexed) where this paragraph starts in the source
+    /// document.
+    pub fn line(&self) -> usize {
+        self.0.line()
+    }
+
+    /// Line number (0-indexed) where the `Files:` field starts in the
+    /// source document, or `None` when the paragraph carries no `Files:`
+    /// field. Useful for constructing lintian-style pointers of the form
+    /// `[debian/copyright:LINE]`.
+    pub fn files_line(&self) -> Option<usize> {
+        self.0.get_entry("Files").map(|e| e.line())
+    }
+
     /// List of file patterns in the paragraph
     pub fn files(&self) -> Vec<String> {
         self.0
@@ -1246,6 +1274,35 @@ the Free Software Foundation, either version 3 of the License, or
             let end: usize = range.end().into();
             assert_eq!(&s[start..end], pat);
         }
+    }
+
+    #[test]
+    fn test_files_raw_single_line() {
+        let s = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\nFiles: src/* debian/*\nCopyright: 2024 Alice\nLicense: MIT\n";
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let fp = copyright.iter_files().next().unwrap();
+        assert_eq!(fp.files_raw().as_deref(), Some("src/* debian/*"));
+    }
+
+    #[test]
+    fn test_files_raw_multi_line_matches_deb822_get() {
+        // Continuation lines are joined with a newline in the raw value,
+        // matching the underlying deb822 get() behaviour so callers can use
+        // it as a selector key.
+        let s = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\nFiles: src/main.c\n debian/copyright\nCopyright: 2024 Alice\nLicense: MIT\n";
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let fp = copyright.iter_files().next().unwrap();
+        assert_eq!(fp.files_raw(), fp.as_deb822().get("Files"));
+    }
+
+    #[test]
+    fn test_files_paragraph_line_and_files_line() {
+        let s = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: foo\n\nFiles: *\nCopyright: 2024 Alice\nLicense: MIT\n";
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let fp = copyright.iter_files().next().unwrap();
+        // Paragraph starts on line 3 (0-indexed), where "Files: *" appears.
+        assert_eq!(fp.line(), 3);
+        assert_eq!(fp.files_line(), Some(3));
     }
 
     #[test]
