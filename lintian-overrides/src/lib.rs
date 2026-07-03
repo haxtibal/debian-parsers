@@ -84,7 +84,7 @@ pub enum SyntaxKind {
 use SyntaxKind::*;
 
 /// The package type keywords valid in a lintian-overrides spec.
-const PACKAGE_TYPES: &[&str] = &["source", "binary", "udeb"];
+pub const PACKAGE_TYPES: &[&str] = &["source", "binary", "udeb"];
 
 impl From<SyntaxKind> for rowan::SyntaxKind {
     fn from(kind: SyntaxKind) -> Self {
@@ -269,6 +269,17 @@ impl LintianOverrides {
             .package_spec()
             .filter(|spec| spec.contains_offset(offset))?
             .package_name()
+    }
+
+    /// Return the override line whose source range includes `offset`.
+    ///
+    /// Matching is inclusive at both ends, so a cursor at the trailing newline
+    /// still resolves to the preceding line.
+    pub fn line_at_offset(&self, offset: rowan::TextSize) -> Option<OverrideLine> {
+        self.lines().find(|line| {
+            let r = line.syntax().text_range();
+            r.start() <= offset && offset <= r.end()
+        })
     }
 
     /// Convert back to text
@@ -1622,6 +1633,39 @@ mod tests {
     }
 
     #[test]
+    fn test_line_at_offset_finds_containing_line() {
+        let text = "first: tag1\nsecond: tag2\n";
+        let overrides = LintianOverrides::parse(text).tree();
+
+        let line = overrides
+            .line_at_offset(rowan::TextSize::from(0u32))
+            .unwrap();
+        assert_eq!(line.package().unwrap(), "first");
+
+        let line = overrides
+            .line_at_offset(rowan::TextSize::from(15u32))
+            .unwrap();
+        assert_eq!(line.package().unwrap(), "second");
+    }
+
+    #[test]
+    fn test_line_at_offset_boundary_is_inclusive() {
+        let text = "foo: tag\n";
+        let overrides = LintianOverrides::parse(text).tree();
+        let end = rowan::TextSize::of("foo: tag");
+        let line = overrides.line_at_offset(end).unwrap();
+        assert_eq!(line.package().unwrap(), "foo");
+    }
+
+    #[test]
+    fn test_line_at_offset_past_end_returns_none() {
+        let text = "foo: tag\n";
+        let overrides = LintianOverrides::parse(text).tree();
+        let past = rowan::TextSize::of(text) + rowan::TextSize::from(1u32);
+        assert_eq!(overrides.line_at_offset(past), None);
+    }
+
+    #[test]
     fn test_package_spec_visible_on_tagless_line() {
         let text = "foo: \n";
         let parsed = LintianOverrides::parse(text);
@@ -1632,6 +1676,11 @@ mod tests {
 
         let line = parsed.tree().lines().next().unwrap();
         assert_eq!(line.package_spec().unwrap().package_name().unwrap(), "foo");
+    }
+
+    #[test]
+    fn test_package_types_constant() {
+        assert_eq!(PACKAGE_TYPES, &["source", "binary", "udeb"]);
     }
 
     #[test]
