@@ -181,10 +181,22 @@ pub struct FilesParagraph {
 
 impl FilesParagraph {
     /// Check if the given filename matches one of the file patterns in this paragraph.
+    ///
+    /// A pattern that is not a valid glob matches nothing; use
+    /// [`try_compiled_patterns`](Self::try_compiled_patterns) to detect one.
     pub fn matches(&self, filename: &std::path::Path) -> bool {
-        self.compiled_patterns()
-            .iter()
-            .any(|pattern| pattern.is_match(filename.to_str().unwrap()))
+        crate::glob::matches_any(&self.files, filename)
+    }
+
+    /// The paragraph's Files patterns, compiled for matching.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pattern is not a valid glob. Copyright files are arbitrary
+    /// input, so prefer [`try_compiled_patterns`](Self::try_compiled_patterns).
+    #[deprecated(since = "0.1.55", note = "use try_compiled_patterns instead")]
+    pub fn compiled_patterns(&self) -> Vec<crate::GlobPattern> {
+        self.try_compiled_patterns().unwrap()
     }
 
     /// The paragraph's Files patterns, compiled for matching.
@@ -194,10 +206,12 @@ impl FilesParagraph {
     /// rather than calling [`matches`](Self::matches) per path. Each
     /// [`crate::GlobPattern`] reports the pattern it was compiled from, so a
     /// caller can tell which Files entry claimed a path.
-    pub fn compiled_patterns(&self) -> Vec<crate::GlobPattern> {
+    ///
+    /// Returns an error if a pattern is not a valid glob.
+    pub fn try_compiled_patterns(&self) -> Result<Vec<crate::GlobPattern>, crate::glob::GlobError> {
         self.files
             .iter()
-            .map(|f| crate::GlobPattern::new(f))
+            .map(|f| crate::GlobPattern::try_new(f))
             .collect()
     }
 }
@@ -230,10 +244,46 @@ impl Copyright {
     ///
     /// Returns `None` if no matching files paragraph is found.
     ///
+    /// Every lookup recompiles the file patterns; to look up many paths
+    /// against the same `Copyright`, build a [`FileMatcher`] once with
+    /// [`matcher`](Self::matcher) instead.
+    ///
     /// # Arguments
     /// * `path` - The path to the file to find the license for.
     pub fn find_files(&self, path: &std::path::Path) -> Option<&FilesParagraph> {
-        self.files.iter().filter(|f| f.matches(path)).next_back()
+        self.files.iter().rfind(|f| f.matches(path))
+    }
+
+    /// Compile the file patterns once, for looking up many paths.
+    ///
+    /// Returns an error if any Files paragraph has a pattern that is not a
+    /// valid glob. [`find_files`](Self::find_files) instead treats such a
+    /// pattern as matching nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::Copyright;
+    /// use std::path::Path;
+    ///
+    /// let text = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\
+    ///             \n\
+    ///             Files: *\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 John Doe\n";
+    /// let copyright: Copyright = text.parse().unwrap();
+    /// let matcher = copyright.matcher().unwrap();
+    /// for path in ["src/main.rs", "README"] {
+    ///     assert!(matcher.find_files(Path::new(path)).is_some());
+    /// }
+    /// ```
+    pub fn matcher(&self) -> Result<FileMatcher<'_>, crate::glob::GlobError> {
+        let paragraphs = self
+            .files
+            .iter()
+            .map(|p| Ok((p, p.try_compiled_patterns()?)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(FileMatcher { paragraphs })
     }
 
     /// Returns the license for the given file.
@@ -242,7 +292,7 @@ impl Copyright {
         if files.license.text().is_some() {
             return Some(&files.license);
         }
-        self.find_license_by_name(files.license.name().unwrap())
+        self.find_license_by_name(files.license.name()?)
     }
 
     /// Find a license by name.
@@ -256,6 +306,56 @@ impl Copyright {
             .iter()
             .find(|p| p.license.name() == Some(name))
             .map(|p| &p.license)
+    }
+}
+
+/// A [`Copyright`]'s file patterns, compiled once for looking up many paths.
+///
+/// Built with [`Copyright::matcher`]. Unlike [`Copyright::find_files`], which
+/// recompiles every pattern on every call, this compiles each pattern once and
+/// reuses it, and reports which pattern claimed a path.
+pub struct FileMatcher<'a> {
+    paragraphs: Vec<(&'a FilesParagraph, Vec<crate::GlobPattern>)>,
+}
+
+impl<'a> FileMatcher<'a> {
+    /// Find the files paragraph that matches the given path.
+    ///
+    /// Consistent with the specification, this returns the last paragraph that
+    /// matches, which is the most specific one.
+    pub fn find_files(&self, path: &Path) -> Option<&'a FilesParagraph> {
+        self.find_match(path).map(|(paragraph, _)| paragraph)
+    }
+
+    /// Find the files paragraph that matches the given path, along with the
+    /// pattern that claimed it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::Copyright;
+    /// use std::path::Path;
+    ///
+    /// let text = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\
+    ///             \n\
+    ///             Files: *\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 John Doe\n\
+    ///             \n\
+    ///             Files: debian/*\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 Jane Packager\n";
+    /// let copyright: Copyright = text.parse().unwrap();
+    /// let matcher = copyright.matcher().unwrap();
+    /// let (_, pattern) = matcher.find_match(Path::new("debian/rules")).unwrap();
+    /// assert_eq!(pattern.pattern(), "debian/*");
+    /// ```
+    pub fn find_match(&self, path: &Path) -> Option<(&'a FilesParagraph, &crate::GlobPattern)> {
+        let path = path.to_str()?;
+        self.paragraphs.iter().rev().find_map(|(paragraph, globs)| {
+            let glob = globs.iter().find(|glob| glob.is_match(path))?;
+            Some((*paragraph, glob))
+        })
     }
 }
 
@@ -369,5 +469,77 @@ the Free Software Foundation, either version 3 of the License, or
 
         let gpl = copyright.find_license_for_file(std::path::Path::new("debian/foo.c"));
         assert_eq!(gpl.unwrap().name().unwrap(), "GPL-3+");
+    }
+
+    #[test]
+    fn test_matches_invalid_pattern() {
+        // An invalid escape in Files used to panic; it now matches nothing.
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: src\x
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        assert!(!copyright.files[0].matches(std::path::Path::new(r"src\x")));
+        assert_eq!(
+            copyright.files[0]
+                .try_compiled_patterns()
+                .unwrap_err()
+                .pattern(),
+            r"src\x",
+        );
+        assert!(copyright
+            .find_files(std::path::Path::new(r"src\x"))
+            .is_none());
+        assert!(copyright.matcher().is_err());
+    }
+
+    #[test]
+    fn test_matcher() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+
+Files: debian/*
+License: GPL-2+
+Copyright: 2019 Jane Packager
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let matcher = copyright.matcher().unwrap();
+
+        let (paragraph, pattern) = matcher
+            .find_match(std::path::Path::new("debian/rules"))
+            .unwrap();
+        assert_eq!(pattern.pattern(), "debian/*");
+        assert_eq!(paragraph.license.name(), Some("GPL-2+"));
+
+        let (paragraph, pattern) = matcher
+            .find_match(std::path::Path::new("src/foo.c"))
+            .unwrap();
+        assert_eq!(pattern.pattern(), "*");
+        assert_eq!(paragraph.license.name(), Some("GPL-3+"));
+    }
+
+    #[test]
+    fn test_matcher_agrees_with_find_files() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+
+Files: debian/*
+License: GPL-2+
+Copyright: 2019 Jane Packager
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let matcher = copyright.matcher().unwrap();
+        for path in ["src/foo.c", "debian/rules", "debian/patches/series"] {
+            let path = std::path::Path::new(path);
+            assert_eq!(matcher.find_files(path), copyright.find_files(path));
+        }
     }
 }

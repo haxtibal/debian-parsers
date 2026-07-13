@@ -235,8 +235,44 @@ impl Copyright {
     ///
     /// Consistent with the specification, this returns the last paragraph
     /// that matches (which should be the most specific)
+    ///
+    /// Every lookup recompiles the file patterns; to look up many paths
+    /// against the same `Copyright`, build a [`FileMatcher`] once with
+    /// [`matcher`](Self::matcher) instead.
     pub fn find_files(&self, filename: &Path) -> Option<FilesParagraph> {
         self.iter_files().filter(|p| p.matches(filename)).last()
+    }
+
+    /// Compile the file patterns once, for looking up many paths.
+    ///
+    /// Returns an error if any Files paragraph has a pattern that is not a
+    /// valid glob. [`find_files`](Self::find_files) instead treats such a
+    /// pattern as matching nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::lossless::Copyright;
+    /// use std::path::Path;
+    ///
+    /// let text = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\
+    ///             \n\
+    ///             Files: *\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 John Doe\n";
+    /// let copyright: Copyright = text.parse().unwrap();
+    /// let matcher = copyright.matcher().unwrap();
+    /// assert!(matcher.find_files(Path::new("src/main.rs")).is_some());
+    /// ```
+    pub fn matcher(&self) -> Result<FileMatcher, crate::glob::GlobError> {
+        let paragraphs = self
+            .iter_files()
+            .map(|p| {
+                let patterns = p.try_compiled_patterns()?;
+                Ok((p, patterns))
+            })
+            .collect::<Result<Vec<_>, crate::glob::GlobError>>()?;
+        Ok(FileMatcher { paragraphs })
     }
 
     /// Find license by name
@@ -467,6 +503,56 @@ impl Copyright {
     }
 }
 
+/// A [`Copyright`]'s file patterns, compiled once for looking up many paths.
+///
+/// Built with [`Copyright::matcher`]. Unlike [`Copyright::find_files`], which
+/// recompiles every pattern on every call, this compiles each pattern once and
+/// reuses it, and reports which pattern claimed a path.
+pub struct FileMatcher {
+    paragraphs: Vec<(FilesParagraph, Vec<crate::GlobPattern>)>,
+}
+
+impl FileMatcher {
+    /// Find the files paragraph that matches the given path.
+    ///
+    /// Consistent with the specification, this returns the last paragraph that
+    /// matches, which is the most specific one.
+    pub fn find_files(&self, path: &Path) -> Option<&FilesParagraph> {
+        self.find_match(path).map(|(paragraph, _)| paragraph)
+    }
+
+    /// Find the files paragraph that matches the given path, along with the
+    /// pattern that claimed it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::lossless::Copyright;
+    /// use std::path::Path;
+    ///
+    /// let text = "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\
+    ///             \n\
+    ///             Files: *\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 John Doe\n\
+    ///             \n\
+    ///             Files: debian/*\n\
+    ///             License: GPL-3+\n\
+    ///             Copyright: 2019 Jane Packager\n";
+    /// let copyright: Copyright = text.parse().unwrap();
+    /// let matcher = copyright.matcher().unwrap();
+    /// let (_, pattern) = matcher.find_match(Path::new("debian/rules")).unwrap();
+    /// assert_eq!(pattern.pattern(), "debian/*");
+    /// ```
+    pub fn find_match(&self, path: &Path) -> Option<(&FilesParagraph, &crate::GlobPattern)> {
+        let path = path.to_str()?;
+        self.paragraphs.iter().rev().find_map(|(paragraph, globs)| {
+            let glob = globs.iter().find(|glob| glob.is_match(path))?;
+            Some((paragraph, glob))
+        })
+    }
+}
+
 /// Error parsing copyright files
 #[derive(Debug)]
 pub enum Error {
@@ -641,19 +727,16 @@ impl Header {
     /// A file is considered excluded if it matches any pattern in `Files-Excluded`
     /// and does not match any pattern in `Files-Included`. If there are no
     /// `Files-Excluded` entries, all files are considered included.
+    ///
+    /// A pattern that is not a valid glob matches nothing, so it excludes no
+    /// file and re-includes none either.
     pub fn is_file_included(&self, filename: &Path) -> bool {
         let excluded = self.files_excluded().unwrap_or_default();
-        let fname = filename.to_str().unwrap();
-        let is_excluded = excluded
-            .iter()
-            .any(|pattern| crate::GlobPattern::new(pattern).is_match(fname));
-        if !is_excluded {
+        if !crate::glob::matches_any(&excluded, filename) {
             return true;
         }
         let included = self.files_included().unwrap_or_default();
-        included
-            .iter()
-            .any(|pattern| crate::GlobPattern::new(pattern).is_match(fname))
+        crate::glob::matches_any(&included, filename)
     }
 
     /// Fix the the header paragraph
@@ -870,10 +953,22 @@ impl FilesParagraph {
     }
 
     /// Check whether the paragraph matches the given filename
+    ///
+    /// A pattern that is not a valid glob matches nothing; use
+    /// [`try_compiled_patterns`](Self::try_compiled_patterns) to detect one.
     pub fn matches(&self, filename: &std::path::Path) -> bool {
-        self.compiled_patterns()
-            .iter()
-            .any(|pattern| pattern.is_match(filename.to_str().unwrap()))
+        crate::glob::matches_any(&self.files(), filename)
+    }
+
+    /// The paragraph's Files patterns, compiled for matching.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pattern is not a valid glob. Copyright files are arbitrary
+    /// input, so prefer [`try_compiled_patterns`](Self::try_compiled_patterns).
+    #[deprecated(since = "0.1.55", note = "use try_compiled_patterns instead")]
+    pub fn compiled_patterns(&self) -> Vec<crate::GlobPattern> {
+        self.try_compiled_patterns().unwrap()
     }
 
     /// The paragraph's Files patterns, compiled for matching.
@@ -883,10 +978,12 @@ impl FilesParagraph {
     /// rather than calling [`matches`](Self::matches) per path. Each
     /// [`crate::GlobPattern`] reports the pattern it was compiled from, so a
     /// caller can tell which Files entry claimed a path.
-    pub fn compiled_patterns(&self) -> Vec<crate::GlobPattern> {
+    ///
+    /// Returns an error if a pattern is not a valid glob.
+    pub fn try_compiled_patterns(&self) -> Result<Vec<crate::GlobPattern>, crate::glob::GlobError> {
         self.files()
             .iter()
-            .map(|f| crate::GlobPattern::new(f))
+            .map(|f| crate::GlobPattern::try_new(f))
             .collect()
     }
 
@@ -2785,6 +2882,102 @@ Copyright: 2019 John Doe
         assert!(header.is_file_included(std::path::Path::new("src/foo.c")));
         assert!(!header.is_file_included(std::path::Path::new("vendor/lib.c")));
         assert!(header.is_file_included(std::path::Path::new("vendor/important.c")));
+    }
+
+    #[test]
+    fn test_is_file_included_invalid_pattern() {
+        // An invalid escape in Files-Excluded used to panic; it now excludes
+        // nothing.
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: example
+Files-Excluded: vendor\x
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let header = copyright.header().unwrap();
+        assert!(header.is_file_included(std::path::Path::new(r"vendor\x")));
+    }
+
+    #[test]
+    fn test_matches_invalid_pattern() {
+        // An invalid escape in Files used to panic; it now matches nothing.
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: src\x
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let paragraph = copyright.iter_files().next().unwrap();
+        assert!(!paragraph.matches(std::path::Path::new(r"src\x")));
+        assert_eq!(
+            paragraph
+                .try_compiled_patterns()
+                .unwrap_err()
+                .pattern()
+                .to_string(),
+            r"src\x",
+        );
+        assert!(copyright
+            .find_files(std::path::Path::new(r"src\x"))
+            .is_none());
+        assert!(copyright.matcher().is_err());
+    }
+
+    #[test]
+    fn test_matcher() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+
+Files: debian/*
+License: GPL-2+
+Copyright: 2019 Jane Packager
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let matcher = copyright.matcher().unwrap();
+
+        let (paragraph, pattern) = matcher
+            .find_match(std::path::Path::new("debian/rules"))
+            .unwrap();
+        assert_eq!(pattern.pattern(), "debian/*");
+        assert_eq!(paragraph.license().unwrap().name(), Some("GPL-2+"));
+
+        let (paragraph, pattern) = matcher
+            .find_match(std::path::Path::new("src/foo.c"))
+            .unwrap();
+        assert_eq!(pattern.pattern(), "*");
+        assert_eq!(paragraph.license().unwrap().name(), Some("GPL-3+"));
+    }
+
+    #[test]
+    fn test_matcher_agrees_with_find_files() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+
+Files: debian/*
+License: GPL-2+
+Copyright: 2019 Jane Packager
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let matcher = copyright.matcher().unwrap();
+        for path in ["src/foo.c", "debian/rules", "debian/patches/series"] {
+            let path = std::path::Path::new(path);
+            assert_eq!(
+                matcher.find_files(path).map(|p| p.license()),
+                copyright.find_files(path).map(|p| p.license()),
+                "mismatch for {}",
+                path.display(),
+            );
+        }
     }
 
     #[test]
