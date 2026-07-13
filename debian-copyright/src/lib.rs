@@ -54,7 +54,7 @@ pub mod expression;
 /// DEP-5 glob pattern matching.
 pub mod glob;
 pub use expression::{ExprParseError, LicenseExpr};
-pub use glob::GlobPattern;
+pub use glob::{GlobError, GlobPattern};
 
 /// Decode deb822 paragraph markers in a multi-line field value.
 ///

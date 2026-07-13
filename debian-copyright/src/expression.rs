@@ -30,6 +30,16 @@ impl ExprParseError {
             input: input.to_string(),
         }
     }
+
+    /// The expression that failed to parse.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// What was wrong with it, without the expression itself.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl std::fmt::Display for ExprParseError {
@@ -180,9 +190,34 @@ impl LicenseExpr {
 
     /// Rebuild the expression with every leaf name and exception converted.
     ///
-    /// Structural: the and/or/with shape is untouched. This is how an
-    /// expression moves between vocabularies, e.g. an SPDX-parsed tree into
-    /// DEP-5 short names.
+    /// Superseded by [`map_leaves`](Self::map_leaves), which takes one closure
+    /// over a whole leaf rather than two interchangeable ones. The two
+    /// converters here have the same signature, so passing them in the wrong
+    /// order compiles and silently swaps names for exceptions.
+    #[deprecated(since = "0.1.55", note = "use LicenseExpr::map_leaves instead")]
+    pub fn map_names(
+        &self,
+        convert_name: &dyn Fn(&str) -> String,
+        convert_exception: &dyn Fn(&str) -> String,
+    ) -> LicenseExpr {
+        self.map_leaves(|leaf| match leaf {
+            LicenseExpr::Name(n) => LicenseExpr::Name(convert_name(n)),
+            LicenseExpr::WithException(n, e) => {
+                LicenseExpr::WithException(convert_name(n), convert_exception(e))
+            }
+            other => other.clone(),
+        })
+    }
+
+    /// Rebuild the expression with every leaf converted.
+    ///
+    /// Structural: the and/or/with shape is untouched, and `convert` is called
+    /// on each [`Name`](LicenseExpr::Name) and
+    /// [`WithException`](LicenseExpr::WithException) leaf in turn. This is how
+    /// an expression moves between vocabularies, e.g. an SPDX-parsed tree into
+    /// DEP-5 short names. Passing the leaf whole (rather than a name and an
+    /// exception separately) means a conversion sees the license and its
+    /// exception together, which matters when the pair maps to a single name.
     ///
     /// # Examples
     ///
@@ -190,35 +225,25 @@ impl LicenseExpr {
     /// use debian_copyright::LicenseExpr;
     ///
     /// let expr = LicenseExpr::parse_spdx("MIT OR GPL-2.0-only").unwrap();
-    /// let mapped = expr.map_names(
-    ///     &|name| if name == "MIT" { "Expat".to_string() } else { name.to_string() },
-    ///     &|exception| exception.to_string(),
-    /// );
+    /// let mapped = expr.map_leaves(|leaf| match leaf {
+    ///     LicenseExpr::Name(name) if name == "MIT" => LicenseExpr::Name("Expat".to_string()),
+    ///     other => other.clone(),
+    /// });
     /// assert_eq!(mapped.to_string(), "Expat or GPL-2.0-only");
     /// ```
-    pub fn map_names(
-        &self,
-        convert_name: &dyn Fn(&str) -> String,
-        convert_exception: &dyn Fn(&str) -> String,
-    ) -> LicenseExpr {
-        match self {
-            LicenseExpr::Name(n) => LicenseExpr::Name(convert_name(n)),
-            LicenseExpr::WithException(n, e) => {
-                LicenseExpr::WithException(convert_name(n), convert_exception(e))
+    pub fn map_leaves(&self, convert: impl Fn(&LicenseExpr) -> LicenseExpr) -> LicenseExpr {
+        fn walk(expr: &LicenseExpr, convert: &impl Fn(&LicenseExpr) -> LicenseExpr) -> LicenseExpr {
+            match expr {
+                LicenseExpr::Name(_) | LicenseExpr::WithException(..) => convert(expr),
+                LicenseExpr::And(exprs) => {
+                    LicenseExpr::And(exprs.iter().map(|e| walk(e, convert)).collect())
+                }
+                LicenseExpr::Or(exprs) => {
+                    LicenseExpr::Or(exprs.iter().map(|e| walk(e, convert)).collect())
+                }
             }
-            LicenseExpr::And(exprs) => LicenseExpr::And(
-                exprs
-                    .iter()
-                    .map(|e| e.map_names(convert_name, convert_exception))
-                    .collect(),
-            ),
-            LicenseExpr::Or(exprs) => LicenseExpr::Or(
-                exprs
-                    .iter()
-                    .map(|e| e.map_names(convert_name, convert_exception))
-                    .collect(),
-            ),
         }
+        walk(self, &convert)
     }
 
     /// The expression's leaves ([`Name`](LicenseExpr::Name) and
@@ -338,6 +363,30 @@ impl LicenseExpr {
                 }
             }
         }
+    }
+}
+
+impl std::str::FromStr for LicenseExpr {
+    type Err = ExprParseError;
+
+    /// Parse a DEP-5 license expression, rejecting malformed input.
+    ///
+    /// This is [`LicenseExpr::parse_strict`], not the lenient
+    /// [`LicenseExpr::parse`]: a `FromStr` that never fails would make the
+    /// `Result` a lie. Reading arbitrary copyright fields, where prose in a
+    /// `License` field must survive rather than fail, wants `parse` instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// let expr: LicenseExpr = "GPL-2+ or MIT".parse().unwrap();
+    /// assert_eq!(expr.license_names(), vec!["GPL-2+", "MIT"]);
+    /// assert!("Apache 2.0".parse::<LicenseExpr>().is_err());
+    /// ```
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        LicenseExpr::parse_strict(s)
     }
 }
 
@@ -1340,6 +1389,7 @@ mod tests {
         }
     }
 
+    #[allow(deprecated)]
     #[test]
     fn test_map_names() {
         let expr =
@@ -1358,6 +1408,69 @@ mod tests {
         assert_eq!(
             mapped.to_string(),
             "Expat or GPL-2 with ClassPath exception"
+        );
+    }
+
+    #[test]
+    fn test_map_leaves() {
+        let expr =
+            LicenseExpr::parse_spdx("MIT OR GPL-2.0-only WITH Classpath-exception-2.0").unwrap();
+        let mapped = expr.map_leaves(|leaf| match leaf {
+            LicenseExpr::Name(name) if name == "MIT" => LicenseExpr::Name("Expat".to_string()),
+            LicenseExpr::WithException(name, exception)
+                if name == "GPL-2.0-only" && exception == "Classpath-exception-2.0" =>
+            {
+                LicenseExpr::WithException("GPL-2".to_string(), "ClassPath exception".to_string())
+            }
+            other => other.clone(),
+        });
+        assert_eq!(
+            mapped.to_string(),
+            "Expat or GPL-2 with ClassPath exception"
+        );
+    }
+
+    #[test]
+    fn test_map_leaves_preserves_structure() {
+        let expr = LicenseExpr::parse("A or B, and C");
+        let mapped = expr.map_leaves(|leaf| leaf.clone());
+        assert_eq!(mapped, expr);
+    }
+
+    #[test]
+    fn test_map_leaves_sees_license_and_exception_together() {
+        // A leaf whose license and exception together map to one DEP-5 name;
+        // the deprecated map_names could not express this.
+        let expr = LicenseExpr::parse_spdx("GPL-2.0-only WITH Font-exception-2.0").unwrap();
+        let mapped = expr.map_leaves(|leaf| match leaf {
+            LicenseExpr::WithException(name, exception)
+                if name == "GPL-2.0-only" && exception == "Font-exception-2.0" =>
+            {
+                LicenseExpr::Name("GPL-2-with-font-exception".to_string())
+            }
+            other => other.clone(),
+        });
+        assert_eq!(
+            mapped,
+            LicenseExpr::Name("GPL-2-with-font-exception".into())
+        );
+    }
+
+    #[test]
+    fn test_from_str() {
+        let expr: LicenseExpr = "GPL-2+ or MIT".parse().unwrap();
+        assert_eq!(expr, LicenseExpr::parse_strict("GPL-2+ or MIT").unwrap());
+        assert!("Apache 2.0".parse::<LicenseExpr>().is_err());
+    }
+
+    #[test]
+    fn test_expr_parse_error_accessors() {
+        let err = LicenseExpr::parse_strict("MIT or").unwrap_err();
+        assert_eq!(err.input(), "MIT or");
+        assert_eq!(err.message(), "unexpected end of expression");
+        assert_eq!(
+            err.to_string(),
+            r#"unexpected end of expression in license expression "MIT or""#
         );
     }
 
