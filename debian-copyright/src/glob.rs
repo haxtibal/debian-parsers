@@ -11,17 +11,35 @@
 /// assert!(pat.is_match("src/main.rs"));
 /// assert!(!pat.is_match("lib/main.rs"));
 /// ```
-pub struct GlobPattern(regex::Regex);
+pub struct GlobPattern {
+    regex: regex::Regex,
+    pattern: String,
+}
 
 impl GlobPattern {
     /// Compile a DEP-5 glob pattern.
     pub fn new(pattern: &str) -> Self {
-        Self(glob_to_regex_inner(pattern))
+        Self {
+            regex: glob_to_regex_inner(pattern),
+            pattern: pattern.to_string(),
+        }
     }
 
     /// Check whether a path matches this pattern.
     pub fn is_match(&self, path: &str) -> bool {
-        self.0.is_match(path)
+        self.regex.is_match(path)
+    }
+
+    /// The glob pattern this matcher was compiled from.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pat = debian_copyright::GlobPattern::new("src/*.rs");
+    /// assert_eq!(pat.pattern(), "src/*.rs");
+    /// ```
+    pub fn pattern(&self) -> &str {
+        &self.pattern
     }
 }
 

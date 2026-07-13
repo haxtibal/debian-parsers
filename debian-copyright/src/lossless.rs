@@ -871,9 +871,23 @@ impl FilesParagraph {
 
     /// Check whether the paragraph matches the given filename
     pub fn matches(&self, filename: &std::path::Path) -> bool {
+        self.compiled_patterns()
+            .iter()
+            .any(|pattern| pattern.is_match(filename.to_str().unwrap()))
+    }
+
+    /// The paragraph's Files patterns, compiled for matching.
+    ///
+    /// Compiling a pattern is not free, so callers that match many paths
+    /// against the same paragraph should call this once and reuse the result
+    /// rather than calling [`matches`](Self::matches) per path. Each
+    /// [`crate::GlobPattern`] reports the pattern it was compiled from, so a
+    /// caller can tell which Files entry claimed a path.
+    pub fn compiled_patterns(&self) -> Vec<crate::GlobPattern> {
         self.files()
             .iter()
-            .any(|f| crate::GlobPattern::new(f).is_match(filename.to_str().unwrap()))
+            .map(|f| crate::GlobPattern::new(f))
+            .collect()
     }
 
     /// Copyright holders in the paragraph
