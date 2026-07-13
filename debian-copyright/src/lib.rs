@@ -53,7 +53,7 @@ pub const KNOWN_FORMATS: &[&str] = &[CURRENT_FORMAT];
 pub mod expression;
 /// DEP-5 glob pattern matching.
 pub mod glob;
-pub use expression::LicenseExpr;
+pub use expression::{ExprParseError, LicenseExpr};
 pub use glob::GlobPattern;
 
 /// Decode deb822 paragraph markers in a multi-line field value.

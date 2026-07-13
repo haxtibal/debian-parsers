@@ -11,6 +11,35 @@
 //! so malformed names such as `Apache 2.0` survive a parse/display round trip
 //! rather than being truncated at the first space.
 
+/// An error from the strict expression parsers.
+///
+/// [`LicenseExpr::parse`] never fails (malformed input degrades to verbatim
+/// names); [`LicenseExpr::parse_strict`] and [`LicenseExpr::parse_spdx`]
+/// report malformed input with this error instead, so callers can fall back
+/// to treating the field as an opaque literal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExprParseError {
+    message: String,
+    input: String,
+}
+
+impl ExprParseError {
+    fn new(message: impl Into<String>, input: &str) -> Self {
+        ExprParseError {
+            message: message.into(),
+            input: input.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ExprParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} in license expression {:?}", self.message, self.input)
+    }
+}
+
+impl std::error::Error for ExprParseError {}
+
 /// A parsed license expression from a DEP-5 copyright file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LicenseExpr {
@@ -53,6 +82,178 @@ impl LicenseExpr {
             return LicenseExpr::Name(String::new());
         }
         parse_expr(input, &tokens)
+    }
+
+    /// Parse a license expression string, rejecting malformed input.
+    ///
+    /// Unlike [`parse`](Self::parse), which accepts anything (unparseable
+    /// constructs survive verbatim inside names), this enforces the DEP-5
+    /// short-name grammar: a license name is a single token, operators may
+    /// not dangle, and a comma must introduce a lowered `and`/`or`. Callers
+    /// use it to detect fields that are not really expressions and treat
+    /// them as opaque literals instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// assert!(LicenseExpr::parse_strict("GPL-2+ or MIT").is_ok());
+    /// assert!(LicenseExpr::parse_strict("Apache 2.0").is_err());
+    /// assert!(LicenseExpr::parse_strict("MIT or").is_err());
+    /// ```
+    pub fn parse_strict(input: &str) -> Result<Self, ExprParseError> {
+        let tokens = tokenize(input);
+        StrictParser {
+            input,
+            tokens: &tokens,
+            pos: 0,
+        }
+        .parse()
+    }
+
+    /// Parse an SPDX license expression.
+    ///
+    /// SPDX expressions use uppercase `AND`/`OR`/`WITH` operators (accepted
+    /// case-insensitively here, as found in the wild) and parentheses for
+    /// grouping; `WITH` attaches an exception identifier to a single license
+    /// id. The resulting tree uses the same [`LicenseExpr`] vocabulary as the
+    /// DEP-5 parsers, with leaf names kept verbatim; use
+    /// [`map_names`](Self::map_names) to convert them to DEP-5 names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// let expr = LicenseExpr::parse_spdx("(MIT AND ISC) OR GPL-2.0-only").unwrap();
+    /// assert_eq!(expr, LicenseExpr::Or(vec![
+    ///     LicenseExpr::And(vec![
+    ///         LicenseExpr::Name("MIT".to_string()),
+    ///         LicenseExpr::Name("ISC".to_string()),
+    ///     ]),
+    ///     LicenseExpr::Name("GPL-2.0-only".to_string()),
+    /// ]));
+    /// ```
+    pub fn parse_spdx(input: &str) -> Result<Self, ExprParseError> {
+        let tokens = spdx_tokenize(input);
+        SpdxParser {
+            input,
+            tokens: &tokens,
+            pos: 0,
+        }
+        .parse()
+    }
+
+    /// Render the expression as an unambiguous SPDX string.
+    ///
+    /// Compound operands are parenthesised, so the result round-trips
+    /// through [`parse_spdx`](Self::parse_spdx) even for nestings DEP-5
+    /// cannot express. Leaf names and exceptions are emitted verbatim; use
+    /// [`map_names`](Self::map_names) first to convert DEP-5 names to SPDX
+    /// identifiers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// let expr = LicenseExpr::parse_spdx("(MIT AND ISC) OR GPL-2.0-only").unwrap();
+    /// assert_eq!(expr.to_spdx_string(), "(MIT AND ISC) OR GPL-2.0-only");
+    /// ```
+    pub fn to_spdx_string(&self) -> String {
+        fn operand(expr: &LicenseExpr) -> String {
+            match expr {
+                LicenseExpr::And(_) | LicenseExpr::Or(_) => {
+                    format!("({})", expr.to_spdx_string())
+                }
+                _ => expr.to_spdx_string(),
+            }
+        }
+        match self {
+            LicenseExpr::Name(n) => n.clone(),
+            LicenseExpr::WithException(n, e) => format!("{} WITH {}", n, e),
+            LicenseExpr::And(exprs) => exprs.iter().map(operand).collect::<Vec<_>>().join(" AND "),
+            LicenseExpr::Or(exprs) => exprs.iter().map(operand).collect::<Vec<_>>().join(" OR "),
+        }
+    }
+
+    /// Rebuild the expression with every leaf name and exception converted.
+    ///
+    /// Structural: the and/or/with shape is untouched. This is how an
+    /// expression moves between vocabularies, e.g. an SPDX-parsed tree into
+    /// DEP-5 short names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// let expr = LicenseExpr::parse_spdx("MIT OR GPL-2.0-only").unwrap();
+    /// let mapped = expr.map_names(
+    ///     &|name| if name == "MIT" { "Expat".to_string() } else { name.to_string() },
+    ///     &|exception| exception.to_string(),
+    /// );
+    /// assert_eq!(mapped.to_string(), "Expat or GPL-2.0-only");
+    /// ```
+    pub fn map_names(
+        &self,
+        convert_name: &dyn Fn(&str) -> String,
+        convert_exception: &dyn Fn(&str) -> String,
+    ) -> LicenseExpr {
+        match self {
+            LicenseExpr::Name(n) => LicenseExpr::Name(convert_name(n)),
+            LicenseExpr::WithException(n, e) => {
+                LicenseExpr::WithException(convert_name(n), convert_exception(e))
+            }
+            LicenseExpr::And(exprs) => LicenseExpr::And(
+                exprs
+                    .iter()
+                    .map(|e| e.map_names(convert_name, convert_exception))
+                    .collect(),
+            ),
+            LicenseExpr::Or(exprs) => LicenseExpr::Or(
+                exprs
+                    .iter()
+                    .map(|e| e.map_names(convert_name, convert_exception))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The expression's leaves ([`Name`](LicenseExpr::Name) and
+    /// [`WithException`](LicenseExpr::WithException) nodes), in order.
+    ///
+    /// Unlike [`license_names`](Self::license_names) this keeps the
+    /// exception attached to its license, so a caller grouping by "license
+    /// as licensed" (where `GPL-2 with an exception` is not `GPL-2`) can key
+    /// off each leaf as a whole.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use debian_copyright::LicenseExpr;
+    ///
+    /// let expr = LicenseExpr::parse("GPL-2+ with OpenSSL-exception or MIT");
+    /// let leaves = expr.leaves();
+    /// assert_eq!(leaves.len(), 2);
+    /// assert_eq!(leaves[0].to_string(), "GPL-2+ with OpenSSL-exception");
+    /// assert_eq!(leaves[1].to_string(), "MIT");
+    /// ```
+    pub fn leaves(&self) -> Vec<&LicenseExpr> {
+        let mut out = Vec::new();
+        fn collect<'a>(expr: &'a LicenseExpr, out: &mut Vec<&'a LicenseExpr>) {
+            match expr {
+                LicenseExpr::Name(_) | LicenseExpr::WithException(..) => out.push(expr),
+                LicenseExpr::And(exprs) | LicenseExpr::Or(exprs) => {
+                    for expr in exprs {
+                        collect(expr, out);
+                    }
+                }
+            }
+        }
+        collect(self, &mut out);
+        out
     }
 
     /// Returns the individual license names contained in this expression.
@@ -437,6 +638,297 @@ fn parse_segment(input: &str, tokens: &[Token]) -> LicenseExpr {
     }
 }
 
+/// Strict recursive-descent parser for the DEP-5 short-name grammar
+/// (copyright-format 1.0 sec 7.2). The comma is a precedence level looser
+/// than `or`, applied as a left-associative fold:
+///
+/// ```text
+/// comma-expr := or-expr ( "," ("and"|"or") or-expr )*
+/// or-expr    := and-expr ( "or" and-expr )*
+/// and-expr   := with-expr ( "and" with-expr )*
+/// with-expr  := NAME ( "with" NAME+ )?
+/// ```
+struct StrictParser<'a> {
+    input: &'a str,
+    tokens: &'a [Token],
+    pos: usize,
+}
+
+impl<'a> StrictParser<'a> {
+    fn err<T>(&self, message: &str) -> Result<T, ExprParseError> {
+        Err(ExprParseError::new(message, self.input))
+    }
+
+    fn peek(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos).map(|t| &t.kind)
+    }
+
+    fn parse(mut self) -> Result<LicenseExpr, ExprParseError> {
+        if self.tokens.is_empty() {
+            return self.err("empty expression");
+        }
+        let expr = self.comma_expr()?;
+        if self.pos != self.tokens.len() {
+            return self.err("trailing tokens");
+        }
+        Ok(expr)
+    }
+
+    fn comma_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let mut acc = self.or_expr()?;
+        while self.peek() == Some(&TokenKind::Comma) {
+            self.pos += 1;
+            let op = match self.peek() {
+                Some(TokenKind::And) => TokenKind::And,
+                Some(TokenKind::Or) => TokenKind::Or,
+                _ => return self.err("expected 'and' or 'or' after comma"),
+            };
+            self.pos += 1;
+            let rhs = self.or_expr()?;
+            // Splice same-operator operands so the tree matches what the
+            // lenient parser builds for the equivalent expression.
+            acc = match (op, acc) {
+                (TokenKind::And, LicenseExpr::And(mut exprs)) => {
+                    exprs.push(rhs);
+                    LicenseExpr::And(exprs)
+                }
+                (TokenKind::And, acc) => LicenseExpr::And(vec![acc, rhs]),
+                (_, LicenseExpr::Or(mut exprs)) => {
+                    exprs.push(rhs);
+                    LicenseExpr::Or(exprs)
+                }
+                (_, acc) => LicenseExpr::Or(vec![acc, rhs]),
+            };
+        }
+        Ok(acc)
+    }
+
+    fn or_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let mut terms = vec![self.and_expr()?];
+        while self.peek() == Some(&TokenKind::Or) {
+            self.pos += 1;
+            terms.push(self.and_expr()?);
+        }
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            LicenseExpr::Or(terms)
+        })
+    }
+
+    fn and_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let mut terms = vec![self.with_expr()?];
+        while self.peek() == Some(&TokenKind::And) {
+            self.pos += 1;
+            terms.push(self.with_expr()?);
+        }
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            LicenseExpr::And(terms)
+        })
+    }
+
+    fn with_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let name = self.name()?;
+        if self.peek() != Some(&TokenKind::With) {
+            return Ok(LicenseExpr::Name(name));
+        }
+        self.pos += 1;
+        // The exception phrase may span several words ("Autoconf exception").
+        let start = match self.tokens.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::Word,
+                range,
+            }) => range.start,
+            _ => return self.err("expected exception after 'with'"),
+        };
+        let mut end = self.tokens[self.pos].range.end;
+        self.pos += 1;
+        while let Some(Token {
+            kind: TokenKind::Word,
+            range,
+        }) = self.tokens.get(self.pos)
+        {
+            end = range.end;
+            self.pos += 1;
+        }
+        Ok(LicenseExpr::WithException(
+            name,
+            self.input[start..end].to_string(),
+        ))
+    }
+
+    fn name(&mut self) -> Result<String, ExprParseError> {
+        match self.tokens.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::Word,
+                range,
+            }) => {
+                self.pos += 1;
+                // A second consecutive word would be a multi-word name, which
+                // the short-name grammar does not allow.
+                if let Some(TokenKind::Word) = self.peek() {
+                    return self.err("expected operator between license names");
+                }
+                Ok(self.input[range.clone()].to_string())
+            }
+            Some(_) => self.err("expected license name"),
+            None => self.err("unexpected end of expression"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SpdxToken<'a> {
+    Id(&'a str),
+    And,
+    Or,
+    With,
+    Open,
+    Close,
+}
+
+fn spdx_tokenize(input: &str) -> Vec<SpdxToken<'_>> {
+    fn classify(word: &str) -> SpdxToken<'_> {
+        if word.eq_ignore_ascii_case("and") {
+            SpdxToken::And
+        } else if word.eq_ignore_ascii_case("or") {
+            SpdxToken::Or
+        } else if word.eq_ignore_ascii_case("with") {
+            SpdxToken::With
+        } else {
+            SpdxToken::Id(word)
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in input.char_indices() {
+        match c {
+            '(' | ')' => {
+                if let Some(s) = start.take() {
+                    tokens.push(classify(&input[s..i]));
+                }
+                tokens.push(if c == '(' {
+                    SpdxToken::Open
+                } else {
+                    SpdxToken::Close
+                });
+            }
+            c if c.is_whitespace() => {
+                if let Some(s) = start.take() {
+                    tokens.push(classify(&input[s..i]));
+                }
+            }
+            _ => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(classify(&input[s..]));
+    }
+    tokens
+}
+
+/// Recursive-descent parser for SPDX license expressions:
+///
+/// ```text
+/// or-expr   := and-expr  ( "OR"  and-expr )*
+/// and-expr  := with-expr ( "AND" with-expr )*
+/// with-expr := atom ( "WITH" exception-id )?
+/// atom      := license-id | "(" or-expr ")"
+/// ```
+struct SpdxParser<'a> {
+    input: &'a str,
+    tokens: &'a [SpdxToken<'a>],
+    pos: usize,
+}
+
+impl<'a> SpdxParser<'a> {
+    fn err<T>(&self, message: &str) -> Result<T, ExprParseError> {
+        Err(ExprParseError::new(message, self.input))
+    }
+
+    fn parse(mut self) -> Result<LicenseExpr, ExprParseError> {
+        if self.tokens.is_empty() {
+            return self.err("empty expression");
+        }
+        let expr = self.or_expr()?;
+        if self.pos != self.tokens.len() {
+            return self.err("trailing tokens");
+        }
+        Ok(expr)
+    }
+
+    fn or_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let mut terms = vec![self.and_expr()?];
+        while self.tokens.get(self.pos) == Some(&SpdxToken::Or) {
+            self.pos += 1;
+            terms.push(self.and_expr()?);
+        }
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            LicenseExpr::Or(terms)
+        })
+    }
+
+    fn and_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let mut terms = vec![self.with_expr()?];
+        while self.tokens.get(self.pos) == Some(&SpdxToken::And) {
+            self.pos += 1;
+            terms.push(self.with_expr()?);
+        }
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            LicenseExpr::And(terms)
+        })
+    }
+
+    fn with_expr(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        let atom = self.atom()?;
+        if self.tokens.get(self.pos) != Some(&SpdxToken::With) {
+            return Ok(atom);
+        }
+        self.pos += 1;
+        // SPDX: WITH applies to a license id only, not a parenthesised group.
+        let LicenseExpr::Name(name) = atom else {
+            return self.err("WITH must follow a license id");
+        };
+        match self.tokens.get(self.pos) {
+            Some(SpdxToken::Id(exception)) => {
+                self.pos += 1;
+                Ok(LicenseExpr::WithException(name, exception.to_string()))
+            }
+            _ => self.err("expected exception id after WITH"),
+        }
+    }
+
+    fn atom(&mut self) -> Result<LicenseExpr, ExprParseError> {
+        match self.tokens.get(self.pos) {
+            Some(SpdxToken::Id(id)) => {
+                self.pos += 1;
+                Ok(LicenseExpr::Name(id.to_string()))
+            }
+            Some(SpdxToken::Open) => {
+                self.pos += 1;
+                let expr = self.or_expr()?;
+                if self.tokens.get(self.pos) != Some(&SpdxToken::Close) {
+                    return self.err("expected ')'");
+                }
+                self.pos += 1;
+                Ok(expr)
+            }
+            Some(_) => self.err("expected license id"),
+            None => self.err("unexpected end of expression"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +1208,164 @@ mod tests {
     #[test]
     fn test_lone_comma() {
         assert_eq!(LicenseExpr::parse(","), LicenseExpr::Name(String::new()));
+    }
+
+    #[test]
+    fn test_parse_strict_valid() {
+        for input in [
+            "MIT",
+            "GPL-2+ or MIT",
+            "Apache-2.0 and BSD-3-clause",
+            "GPL-2+ with OpenSSL-exception",
+            "GPL-2+ with Autoconf exception",
+            "A or B, and C",
+            "A, and B or C, or D",
+            "GPL-1+ or Artistic or Perl",
+        ] {
+            let strict = LicenseExpr::parse_strict(input)
+                .unwrap_or_else(|e| panic!("strict parse failed for {input:?}: {e}"));
+            assert_eq!(
+                strict,
+                LicenseExpr::parse(input),
+                "tree mismatch for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_strict_rejects_malformed() {
+        for input in [
+            "",
+            "   ",
+            "Apache 2.0",
+            "MIT or",
+            "or MIT",
+            "MIT or or GPL-2",
+            "MIT with",
+            "MIT, GPL-2",
+            "A, B, and C",
+            ",",
+        ] {
+            assert!(
+                LicenseExpr::parse_strict(input).is_err(),
+                "strict parse accepted {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_spdx_simple() {
+        assert_eq!(
+            LicenseExpr::parse_spdx("MIT OR Apache-2.0").unwrap(),
+            LicenseExpr::Or(vec![
+                LicenseExpr::Name("MIT".into()),
+                LicenseExpr::Name("Apache-2.0".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_spdx_case_insensitive_operators() {
+        assert_eq!(
+            LicenseExpr::parse_spdx("MIT or Apache-2.0").unwrap(),
+            LicenseExpr::parse_spdx("MIT OR Apache-2.0").unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_parse_spdx_with() {
+        assert_eq!(
+            LicenseExpr::parse_spdx("GPL-2.0-only WITH Classpath-exception-2.0").unwrap(),
+            LicenseExpr::WithException("GPL-2.0-only".into(), "Classpath-exception-2.0".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_spdx_parens_and_precedence() {
+        // Parens override the AND-binds-tighter default.
+        assert_eq!(
+            LicenseExpr::parse_spdx("MIT AND (ISC OR GPL-2.0-only)").unwrap(),
+            LicenseExpr::And(vec![
+                LicenseExpr::Name("MIT".into()),
+                LicenseExpr::Or(vec![
+                    LicenseExpr::Name("ISC".into()),
+                    LicenseExpr::Name("GPL-2.0-only".into()),
+                ]),
+            ])
+        );
+        assert_eq!(
+            LicenseExpr::parse_spdx("MIT AND ISC OR GPL-2.0-only").unwrap(),
+            LicenseExpr::Or(vec![
+                LicenseExpr::And(vec![
+                    LicenseExpr::Name("MIT".into()),
+                    LicenseExpr::Name("ISC".into()),
+                ]),
+                LicenseExpr::Name("GPL-2.0-only".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_spdx_rejects_malformed() {
+        for input in [
+            "",
+            "MIT OR",
+            "(MIT",
+            "MIT)",
+            "MIT WITH",
+            "(MIT AND ISC) WITH X",
+        ] {
+            assert!(
+                LicenseExpr::parse_spdx(input).is_err(),
+                "SPDX parse accepted {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_spdx_string_round_trip() {
+        for input in [
+            "MIT",
+            "MIT OR Apache-2.0",
+            "(MIT AND ISC) OR GPL-2.0-only",
+            "GPL-2.0-only WITH Classpath-exception-2.0",
+            "MIT AND (ISC OR GPL-2.0-only)",
+        ] {
+            let expr = LicenseExpr::parse_spdx(input).unwrap();
+            assert_eq!(
+                LicenseExpr::parse_spdx(&expr.to_spdx_string()).unwrap(),
+                expr,
+                "round trip failed for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_map_names() {
+        let expr =
+            LicenseExpr::parse_spdx("MIT OR GPL-2.0-only WITH Classpath-exception-2.0").unwrap();
+        let mapped = expr.map_names(
+            &|name| match name {
+                "MIT" => "Expat".to_string(),
+                "GPL-2.0-only" => "GPL-2".to_string(),
+                other => other.to_string(),
+            },
+            &|exception| match exception {
+                "Classpath-exception-2.0" => "ClassPath exception".to_string(),
+                other => other.to_string(),
+            },
+        );
+        assert_eq!(
+            mapped.to_string(),
+            "Expat or GPL-2 with ClassPath exception"
+        );
+    }
+
+    #[test]
+    fn test_leaves() {
+        let expr = LicenseExpr::parse("A and B with C exception or D");
+        let leaves: Vec<String> = expr.leaves().iter().map(|l| l.to_string()).collect();
+        assert_eq!(leaves, vec!["A", "B with C exception", "D"]);
     }
 
     #[test]
