@@ -697,10 +697,12 @@ impl Header {
     }
 
     /// List of files excluded from the copyright information, as well as the source package
+    ///
+    /// The patterns are whitespace-separated and may share a line.
     pub fn files_excluded(&self) -> Option<Vec<String>> {
         self.0
             .get("Files-Excluded")
-            .map(|x| x.split('\n').map(|x| x.to_string()).collect::<Vec<_>>())
+            .map(|x| x.split_whitespace().map(|x| x.to_string()).collect())
     }
 
     /// Set excluded files
@@ -710,10 +712,12 @@ impl Header {
     }
 
     /// List of files re-included after exclusion by `Files-Excluded`
+    ///
+    /// The patterns are whitespace-separated and may share a line.
     pub fn files_included(&self) -> Option<Vec<String>> {
         self.0
             .get("Files-Included")
-            .map(|x| x.split('\n').map(|x| x.to_string()).collect::<Vec<_>>())
+            .map(|x| x.split_whitespace().map(|x| x.to_string()).collect())
     }
 
     /// Set included files
@@ -2815,6 +2819,71 @@ Copyright: 2019 John Doe
             copyright.header().unwrap().files_excluded(),
             Some(vec!["vendor/*".to_string(), ".github/*".to_string(),])
         );
+    }
+
+    #[test]
+    fn test_files_excluded_several_per_line() {
+        // The field is whitespace-separated, so several patterns may share a
+        // line (as mk-origtargz and most hand-written files write them).
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: example
+Files-Excluded: vendor/* .github/*
+ doc/build/* test/data/*
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        assert_eq!(
+            copyright.header().unwrap().files_excluded(),
+            Some(vec![
+                "vendor/*".to_string(),
+                ".github/*".to_string(),
+                "doc/build/*".to_string(),
+                "test/data/*".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_files_included_several_per_line() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: example
+Files-Excluded: vendor/*
+Files-Included: vendor/keep.c vendor/also-keep.c
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        assert_eq!(
+            copyright.header().unwrap().files_included(),
+            Some(vec![
+                "vendor/keep.c".to_string(),
+                "vendor/also-keep.c".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_is_file_included_several_patterns_per_line() {
+        let s = r#"Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: example
+Files-Excluded: vendor/* .github/*
+
+Files: *
+License: GPL-3+
+Copyright: 2019 John Doe
+"#;
+        let copyright = s.parse::<super::Copyright>().expect("failed to parse");
+        let header = copyright.header().unwrap();
+        // Both patterns exclude, not just the first: splitting the field on
+        // newlines alone used to leave ".github/*" glued to its neighbour.
+        assert!(!header.is_file_included(std::path::Path::new("vendor/foo.c")));
+        assert!(!header.is_file_included(std::path::Path::new(".github/workflows/ci.yml")));
+        assert!(header.is_file_included(std::path::Path::new("src/main.c")));
     }
 
     #[test]

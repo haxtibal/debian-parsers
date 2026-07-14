@@ -38,8 +38,10 @@ use crate::CURRENT_FORMAT;
 use deb822_fast::{Deb822, FromDeb822, FromDeb822Paragraph, ToDeb822, ToDeb822Paragraph};
 use std::path::Path;
 
+// File patterns are whitespace-separated and may share a line (patterns
+// cannot contain whitespace; the escape syntax only covers *, ? and \).
 fn deserialize_file_list(text: &str) -> Result<Vec<String>, String> {
-    Ok(text.split('\n').map(|x| x.to_string()).collect())
+    Ok(text.split_whitespace().map(|x| x.to_string()).collect())
 }
 
 fn serialize_file_list(files: &[String]) -> String {
