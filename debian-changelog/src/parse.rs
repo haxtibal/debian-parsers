@@ -447,6 +447,21 @@ fn parse(text: &str) -> Parse<ChangeLog> {
             self.builder.finish_node();
         }
 
+        /// Consume the remainder of the line into a single ERROR node.
+        ///
+        /// Used to recover from trailing junk in an entry header, such as the
+        /// urgency annotations some packages use:
+        /// `dpkg (1.4.0) unstable; urgency=low (HIGH for new source format)`
+        fn error_rest_of_line(&mut self, msg: String) {
+            let offset = self.text_offset;
+            self.builder.start_node(ERROR.into());
+            while self.current().is_some() && self.current() != Some(NEWLINE) {
+                self.bump();
+            }
+            self.errors.push((msg, offset));
+            self.builder.finish_node();
+        }
+
         fn parse_entry_header(&mut self) {
             self.builder.start_node(ENTRY_HEADER.into());
             self.expect(IDENTIFIER);
@@ -503,7 +518,7 @@ fn parse(text: &str) -> Parse<ChangeLog> {
                         self.bump();
                         self.builder.finish_node();
                     } else {
-                        self.error("expected metadata key".to_string());
+                        self.error_rest_of_line("expected metadata key".to_string());
                         self.builder.finish_node();
                         break;
                     }
@@ -511,7 +526,7 @@ fn parse(text: &str) -> Parse<ChangeLog> {
                     if self.current() == Some(EQUALS) {
                         self.bump();
                     } else {
-                        self.error("expected equals".to_string());
+                        self.error_rest_of_line("expected equals".to_string());
                         self.builder.finish_node();
                         break;
                     }
@@ -539,6 +554,9 @@ fn parse(text: &str) -> Parse<ChangeLog> {
                                     }
                                     self.bump(); // consume whitespace
                                 }
+                                // Trailing whitespace before junk is not part
+                                // of the value; leave it for error recovery.
+                                (Some(WHITESPACE), Some(ERROR)) | (Some(WHITESPACE), None) => break,
                                 (Some(WHITESPACE), _) => self.bump(),
                                 (Some(IDENTIFIER), _) => self.bump(),
                                 _ => break,
@@ -546,7 +564,7 @@ fn parse(text: &str) -> Parse<ChangeLog> {
                         }
                         self.builder.finish_node();
                     } else {
-                        self.error("expected metadata value".to_string());
+                        self.error_rest_of_line("expected metadata value".to_string());
                         self.builder.finish_node();
                         break;
                     }
@@ -562,6 +580,11 @@ fn parse(text: &str) -> Parse<ChangeLog> {
                                 continue;
                             }
                         }
+                        // Anything else is trailing junk, e.g. the urgency
+                        // annotations some packages use:
+                        // "urgency=low (HIGH for new source format)"
+                        self.error_rest_of_line("unexpected text after metadata value".to_string());
+                        break;
                     }
                 }
             } else if self.current() == Some(NEWLINE) {
@@ -1903,11 +1926,14 @@ impl EntryHeader {
         })
     }
 
-    /// Returns the urgency of the entry.3
+    /// Returns the urgency of the entry.
+    ///
+    /// Returns `None` if there is no urgency field, or if its value is not a
+    /// recognised urgency.
     pub fn urgency(&self) -> Option<Urgency> {
         for (key, value) in self.metadata() {
             if key.as_str() == "urgency" {
-                return Some(value.parse().unwrap());
+                return value.parse().ok();
             }
         }
         None
