@@ -6,7 +6,7 @@ version = "0.2.24"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
-authors = [ "Jelmer Vernooij <jelmer@jelmer.uk>",]
+authors = ["Jelmer Vernooij <jelmer@jelmer.uk>"]
 
 [dependencies]
 chrono = { version = "0.4.44", optional = true }
@@ -14,7 +14,7 @@ debversion = ">=0.4.6, <0.6"
 lazy-regex = ">=3, <4"
 log = "0.4"
 merge3 = { version = "0.2", default-features = false, optional = true }
-rowan = "0.16.1"
+rowan = { workspace = true }
 textwrap = "0.16.2"
 whoami = { version = ">=1.5, <2", default-features = false }
 

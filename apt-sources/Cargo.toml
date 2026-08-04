@@ -1,8 +1,8 @@
 [package]
 name = "apt-sources"
 authors = [
-    "Michał Fita <4925040+michalfita@users.noreply.github.com>",
-    "Jelmer Vernooĳ <jelmer@jelmer.uk>",
+	"Michał Fita <4925040+michalfita@users.noreply.github.com>",
+	"Jelmer Vernooĳ <jelmer@jelmer.uk>",
 ]
 edition = "2021"
 version = "0.3.0"
@@ -23,19 +23,29 @@ launchpad = ["dep:launchpadlib", "dep:reqwest", "dep:serde_json"]
 cli = ["dep:clap", "dep:env_logger", "dep:log"]
 
 [dependencies]
-deb822-fast = { version = ">=0.1, <0.3", path = "../deb822-fast", features = ["derive"] }
+deb822-fast = { version = ">=0.1, <0.3", path = "../deb822-fast", features = [
+	"derive",
+] }
 url = { version = "2.5.4", features = ["serde"] }
 tracing = { version = "0.1", optional = true }
 sequoia-net = { version = "0.30", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt", "macros"], optional = true }
 sequoia-openpgp = { version = "2.0", default-features = false, features = [
-    "compression-deflate",
-    "crypto-nettle",
+	"compression-deflate",
+	"crypto-nettle",
 ], optional = true }
 regex = { version = "1.11.1", optional = true }
 itertools = { version = ">=0.14.0,<0.16.0" }
-launchpadlib = { version = "0.5.5", optional = true, default-features = false, features = ["blocking", "api-v1_0", "packages", "keyring"] }
-reqwest = { version = ">=0.12,<0.14", features = ["blocking", "json"], optional = true }
+launchpadlib = { version = "0.5.5", optional = true, default-features = false, features = [
+	"blocking",
+	"api-v1_0",
+	"packages",
+	"keyring",
+] }
+reqwest = { version = ">=0.12,<0.14", features = [
+	"blocking",
+	"json",
+], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 env_logger = { version = "0.11", optional = true }
 log = { version = "0.4", optional = true }
