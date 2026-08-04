@@ -11,6 +11,6 @@ readme = "README.md"
 documentation = "https://docs.rs/lintian-overrides"
 
 [dependencies]
-rowan = "0.16"
+rowan = { workspace = true }
 lazy_static = "1"
 regex = "1"

@@ -11,11 +11,13 @@ keywords = ["debian", "deb822", "rfc822", "lossless", "edit"]
 categories = ["parser-implementations"]
 
 [dependencies]
-rowan = { version = "0.16", optional = true }
+rowan = { workspace = true, optional = true }
 debversion = ">=0.4.7, <0.6"
 regex = ">=1, <2"
 deb822-lossless = { version = ">=0.5.16, <0.6", path = "../deb822-lossless", optional = true }
-deb822-fast = { path = "../deb822-fast", features = ["derive"], version = ">=0.2.0, <0.3" }
+deb822-fast = { path = "../deb822-fast", features = [
+	"derive",
+], version = ">=0.2.0, <0.3" }
 url = ">=2, <3"
 pyo3 = { workspace = true, optional = true }
 chrono = { version = ">=0.4, <0.5", optional = true }
