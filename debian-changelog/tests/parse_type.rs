@@ -297,6 +297,42 @@ fn test_unparsable_urgency_returns_none() {
     assert_eq!(entry.urgency(), None);
 }
 
+#[test]
+fn test_try_urgency_distinguishes_absent_from_invalid() {
+    let with_urgency = |field: &str| {
+        format!(
+            "dpkg (1.4.0) unstable{field}
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+"
+        )
+    };
+
+    // Valid urgency
+    let cl = ChangeLog::parse_relaxed(&with_urgency("; urgency=low"));
+    let entry = cl.iter().next().unwrap();
+    assert_eq!(entry.try_urgency().unwrap().unwrap(), Urgency::Low);
+    assert_eq!(
+        entry.header().unwrap().try_urgency().unwrap().unwrap(),
+        Urgency::Low
+    );
+
+    // Present but unrecognised: Some(Err(..)), where urgency() gives None
+    let cl = ChangeLog::parse_relaxed(&with_urgency("; urgency=bogus"));
+    let entry = cl.iter().next().unwrap();
+    let err = entry.try_urgency().unwrap().unwrap_err();
+    assert_eq!(err.to_string(), "invalid urgency: bogus\n");
+    assert_eq!(entry.urgency(), None);
+
+    // Absent: None
+    let cl = ChangeLog::parse_relaxed(&with_urgency(""));
+    let entry = cl.iter().next().unwrap();
+    assert!(entry.try_urgency().is_none());
+    assert_eq!(entry.urgency(), None);
+}
+
 /// Older dpkg entries annotate `priority` without parentheses; recovery should
 /// not split these into a bogus second entry either.
 #[test]

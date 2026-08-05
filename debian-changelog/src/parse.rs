@@ -1926,17 +1926,29 @@ impl EntryHeader {
         })
     }
 
+    /// Returns the urgency of the entry, returning an error if the urgency is
+    /// not recognised.
+    ///
+    /// Returns:
+    /// - `Some(Ok(urgency))` if a valid urgency is found
+    /// - `Some(Err(err))` if an urgency field exists but cannot be parsed
+    /// - `None` if no urgency field is present
+    pub fn try_urgency(&self) -> Option<Result<Urgency, ParseError>> {
+        self.metadata().find_map(|(key, value)| {
+            if key.as_str() == "urgency" {
+                Some(value.parse())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Returns the urgency of the entry.
     ///
-    /// Returns `None` if there is no urgency field, or if its value is not a
-    /// recognised urgency.
+    /// Note: This method silently returns `None` if the urgency is not recognised.
+    /// Consider using [`try_urgency`](Self::try_urgency) instead to handle parsing errors properly.
     pub fn urgency(&self) -> Option<Urgency> {
-        for (key, value) in self.metadata() {
-            if key.as_str() == "urgency" {
-                return value.parse().ok();
-            }
-        }
-        None
+        self.try_urgency().and_then(|r| r.ok())
     }
 }
 
@@ -2360,9 +2372,23 @@ impl Entry {
         self.timestamp().and_then(|ts| parse_time_string(&ts).ok())
     }
 
+    /// Returns the urgency of the entry, returning an error if the urgency is
+    /// not recognised.
+    ///
+    /// Returns:
+    /// - `Some(Ok(urgency))` if a valid urgency is found
+    /// - `Some(Err(err))` if an urgency field exists but cannot be parsed
+    /// - `None` if no urgency field is present or no header exists
+    pub fn try_urgency(&self) -> Option<Result<Urgency, ParseError>> {
+        self.header().and_then(|h| h.try_urgency())
+    }
+
     /// Returns the urgency of the entry.
+    ///
+    /// Note: This method silently returns `None` if the urgency is not recognised.
+    /// Consider using [`try_urgency`](Self::try_urgency) instead to handle parsing errors properly.
     pub fn urgency(&self) -> Option<Urgency> {
-        self.header().and_then(|h| h.urgency())
+        self.try_urgency().and_then(|r| r.ok())
     }
 
     fn create_header(&self) -> EntryHeader {
