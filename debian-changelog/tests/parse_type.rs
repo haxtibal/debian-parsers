@@ -1,4 +1,4 @@
-use debian_changelog::{ChangeLog, Parse};
+use debian_changelog::{ChangeLog, Parse, Urgency};
 
 #[test]
 fn test_parse_clone() {
@@ -236,5 +236,132 @@ fn test_invalid_version_no_panic() {
                 }
             }
         }
+    }
+}
+
+/// A changelog header carrying an urgency annotation, as used by dpkg and
+/// cpp-11. See https://github.com/jelmer/debian-parsers/issues/466.
+const URGENCY_ANNOTATION: &str = "dpkg (1.4.0) unstable; urgency=low (HIGH for new source format)
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+";
+
+#[test]
+fn test_urgency_annotation_strict_reports_single_error() {
+    let parsed = ChangeLog::parse(URGENCY_ANNOTATION);
+
+    assert_eq!(
+        parsed.errors(),
+        vec!["unexpected text after metadata value"]
+    );
+
+    let offset = parsed.errors_with_offsets()[0].1;
+    let offset = usize::try_from(u32::from(offset)).unwrap();
+    assert_eq!(
+        &URGENCY_ANNOTATION[offset..offset + "(HIGH for new source format)".len()],
+        "(HIGH for new source format)"
+    );
+}
+
+#[test]
+fn test_urgency_annotation_relaxed_keeps_entry_intact() {
+    let cl = ChangeLog::parse_relaxed(URGENCY_ANNOTATION);
+
+    assert_eq!(cl.iter().count(), 1);
+    assert_eq!(cl.to_string(), URGENCY_ANNOTATION);
+
+    let entry = cl.iter().next().unwrap();
+    assert_eq!(entry.package(), Some("dpkg".to_string()));
+    assert_eq!(entry.distributions(), Some(vec!["unstable".to_string()]));
+    assert_eq!(entry.urgency(), Some(Urgency::Low));
+    assert_eq!(
+        entry.change_lines().collect::<Vec<_>>(),
+        vec!["* Fix something.".to_string()]
+    );
+    assert_eq!(entry.maintainer(), Some("Ian Jackson".to_string()));
+    assert_eq!(entry.email(), Some("ijackson@nyx.cs.du.edu".to_string()));
+}
+
+#[test]
+fn test_unparsable_urgency_returns_none() {
+    let text = "dpkg (1.4.0) unstable; urgency=bogus
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+";
+    let cl = ChangeLog::parse_relaxed(text);
+    let entry = cl.iter().next().unwrap();
+    assert_eq!(entry.urgency(), None);
+}
+
+#[test]
+fn test_try_urgency_distinguishes_absent_from_invalid() {
+    let with_urgency = |field: &str| {
+        format!(
+            "dpkg (1.4.0) unstable{field}
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+"
+        )
+    };
+
+    // Valid urgency
+    let cl = ChangeLog::parse_relaxed(&with_urgency("; urgency=low"));
+    let entry = cl.iter().next().unwrap();
+    assert_eq!(entry.try_urgency().unwrap().unwrap(), Urgency::Low);
+    assert_eq!(
+        entry.header().unwrap().try_urgency().unwrap().unwrap(),
+        Urgency::Low
+    );
+
+    // Present but unrecognised: Some(Err(..)), where urgency() gives None
+    let cl = ChangeLog::parse_relaxed(&with_urgency("; urgency=bogus"));
+    let entry = cl.iter().next().unwrap();
+    let err = entry.try_urgency().unwrap().unwrap_err();
+    assert_eq!(err.to_string(), "invalid urgency: bogus\n");
+    assert_eq!(entry.urgency(), None);
+
+    // Absent: None
+    let cl = ChangeLog::parse_relaxed(&with_urgency(""));
+    let entry = cl.iter().next().unwrap();
+    assert!(entry.try_urgency().is_none());
+    assert_eq!(entry.urgency(), None);
+}
+
+/// Older dpkg entries annotate `priority` without parentheses; recovery should
+/// not split these into a bogus second entry either.
+#[test]
+fn test_unparenthesized_annotation_keeps_entry_intact() {
+    for text in [
+        "dpkg (0.93.67) BETA; priority=LOW for C dpkg alpha testers, HIGH for others
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+",
+        "dpkg (0.93.42) BETA; priority=LOW; HIGH for dselect users
+
+  * Fix something.
+
+ -- Ian Jackson <ijackson@nyx.cs.du.edu>  Thu, 12 Sep 1996 01:13:33 +0100
+",
+    ] {
+        let cl = ChangeLog::parse_relaxed(text);
+        assert_eq!(cl.iter().count(), 1);
+        assert_eq!(cl.to_string(), text);
+
+        let entry = cl.iter().next().unwrap();
+        assert_eq!(entry.package(), Some("dpkg".to_string()));
+        assert_eq!(entry.distributions(), Some(vec!["BETA".to_string()]));
+        assert_eq!(
+            entry.change_lines().collect::<Vec<_>>(),
+            vec!["* Fix something.".to_string()]
+        );
+        assert_eq!(entry.maintainer(), Some("Ian Jackson".to_string()));
     }
 }
